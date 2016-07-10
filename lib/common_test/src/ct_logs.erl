@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2003-2014. All Rights Reserved.
+%% Copyright Ericsson AB 2003-2016. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -137,7 +137,8 @@ close(Info, StartDir) ->
     %% so we need to use a local copy of the log cache data
     LogCacheBin = 
 	case make_last_run_index() of
-	    {error,_} ->  % log server not responding
+	    {error, Reason} ->  % log server not responding
+		io:format("Warning! ct_logs not responding: ~p~n", [Reason]),
 		undefined;
 	    LCB ->
 		LCB
@@ -149,7 +150,7 @@ close(Info, StartDir) ->
 				 ok;
 			     CacheBin ->
 				 %% save final version of the log cache to file
-				 file:write_file(?log_cache_name,CacheBin),
+				 _ = file:write_file(?log_cache_name,CacheBin),
 				 put(ct_log_cache,undefined)
 			 end
 		 end,
@@ -175,12 +176,12 @@ close(Info, StartDir) ->
 		Error ->
 		    io:format("Warning! Cleanup failed: ~p~n", [Error])
 	    end,
-	    make_all_suites_index(stop),
+	    _ = make_all_suites_index(stop),
 	    make_all_runs_index(stop),
 	    Cache2File();
        true -> 
-	    file:set_cwd(".."),
-	    make_all_suites_index(stop),
+	    ok = file:set_cwd(".."),
+	    _ = make_all_suites_index(stop),
 	    make_all_runs_index(stop),
 	    Cache2File(),
 	    case ct_util:get_profile_data(browser, StartDir) of
@@ -240,7 +241,7 @@ call(Msg) ->
 	Pid ->
 	    MRef = erlang:monitor(process,Pid),
 	    Ref = make_ref(),
-	    ?MODULE ! {Msg,{self(),Ref}},
+	    Pid ! {Msg,{self(),Ref}},
 	    receive
 		{Ref, Result} -> 
 		    erlang:demonitor(MRef, [flush]),
@@ -251,15 +252,29 @@ call(Msg) ->
     end.
 
 return({To,Ref},Result) ->
-    To ! {Ref, Result}.
+    To ! {Ref, Result},
+    ok.
 
 cast(Msg) ->
     case whereis(?MODULE) of
 	undefined ->
-	    {error,does_not_exist};
+	    io:format("Warning: ct_logs not started~n"),
+	    {_,_,_,_,_,_,Content,_} = Msg,
+	    FormatArgs = get_format_args(Content),
+	    _ = [io:format(Format, Args) || {Format, Args} <- FormatArgs],
+	    ok;
 	_Pid ->
-	    ?MODULE ! Msg
+	    ?MODULE ! Msg,
+	    ok
     end.
+
+get_format_args(Content) ->
+    lists:map(fun(C) ->
+		  case C of
+		      {_, FA, _} -> FA;
+		      {_, _} -> C
+		  end
+	      end, Content).
 
 %%%-----------------------------------------------------------------
 %%% @spec init_tc(RefreshLog) -> ok
@@ -269,7 +284,7 @@ cast(Msg) ->
 %%% <p>This function is called by ct_framework:init_tc/3</p>
 init_tc(RefreshLog) ->
     call({init_tc,self(),group_leader(),RefreshLog}),
-    io:format(["$tc_html",xhtml("", "<br />")]),
+    tc_io_format(group_leader(), xhtml("", "<br />"), []),
     ok.
 
 %%%-----------------------------------------------------------------
@@ -609,7 +624,8 @@ log_timestamp({MS,S,US}) ->
 		      ct_log_fd,
 		      tc_groupleaders,
 		      stylesheet,
-		      async_print_jobs}).
+		      async_print_jobs,
+		      tc_esc_chars}).
 
 logger(Parent, Mode, Verbosity) ->
     register(?MODULE,self()),
@@ -630,7 +646,7 @@ logger(Parent, Mode, Verbosity) ->
 	end,
     %%! <---
 
-    file:make_dir(Dir),
+    _ = file:make_dir(Dir),
     AbsDir = ?abs(Dir),
     put(ct_run_dir, AbsDir),
 
@@ -670,7 +686,7 @@ logger(Parent, Mode, Verbosity) ->
 	    end
     end,
 
-    test_server_io:start_link(),
+    _ = test_server_io:start_link(),
     MiscIoName = filename:join(Dir, ?misc_io_log),
     {ok,MiscIoFd} = file:open(MiscIoName,
 			      [write,{encoding,utf8}]),
@@ -700,13 +716,13 @@ logger(Parent, Mode, Verbosity) ->
     ct_event:notify(#event{name=start_logging,node=node(),
 			   data=AbsDir}),
     make_all_runs_index(start),
-    make_all_suites_index(start),
+    _ = make_all_suites_index(start),
     case Mode of
 	interactive -> interactive_link();
 	_ -> ok
     end,
-    file:set_cwd(Dir),
-    make_last_run_index(Time),
+    ok = file:set_cwd(Dir),
+    _ = make_last_run_index(Time),
     CtLogFd = open_ctlog(?misc_io_log),
     io:format(CtLogFd,int_header()++int_footer(),
 	      [log_timestamp(?now),"Common Test Logger started"]),
@@ -720,22 +736,26 @@ logger(Parent, Mode, Verbosity) ->
 	GenLvl    -> io:format(CtLogFd, "~-25s~3w~n",
 			       ["general level",GenLvl])
     end,
-    [begin put({verbosity,Cat},VLvl),
-	   if Cat == '$unspecified' ->
+    _ = [begin put({verbosity,Cat},VLvl),
+	     if Cat == '$unspecified' ->
 		   ok;
-	      true ->
+		true ->
 		   io:format(CtLogFd, "~-25w~3w~n", [Cat,VLvl])
-	   end
-     end || {Cat,VLvl} <- Verbosity],
+	     end
+	 end || {Cat,VLvl} <- Verbosity],
     io:nl(CtLogFd),
-
+    TcEscChars = case application:get_env(common_test, esc_chars) of
+		   {ok,ECBool} -> ECBool;
+		   _           -> true
+	       end,
     logger_loop(#logger_state{parent=Parent,
 			      log_dir=AbsDir,
 			      start_time=Time,
 			      orig_GL=group_leader(),
 			      ct_log_fd=CtLogFd,
 			      tc_groupleaders=[],
-			      async_print_jobs=[]}).
+			      async_print_jobs=[],
+			      tc_esc_chars=TcEscChars}).
 
 copy_priv_files([SrcF | SrcFs], [DestF | DestFs]) ->
     case file:copy(SrcF, DestF) of
@@ -761,20 +781,21 @@ logger_loop(State) ->
 		end,
 	    if Importance >= (100-VLvl) ->
 		    CtLogFd = State#logger_state.ct_log_fd,
+		    DoEscChars = State#logger_state.tc_esc_chars and EscChars,
 		    case get_groupleader(Pid, GL, State) of
 			{tc_log,TCGL,TCGLs} ->
 			    case erlang:is_process_alive(TCGL) of
 				true ->
 				    State1 = print_to_log(SyncOrAsync, Pid,
 							  Category, TCGL, Content,
-							  EscChars, State),
+							  DoEscChars, State),
 				    logger_loop(State1#logger_state{
 						  tc_groupleaders = TCGLs});
 				false ->
 				    %% Group leader is dead, so write to the
 				    %% CtLog or unexpected_io log instead
 				    unexpected_io(Pid, Category, Importance,
-						  Content, CtLogFd, EscChars),
+						  Content, CtLogFd, DoEscChars),
 
 				    logger_loop(State)			    
 			    end;
@@ -783,7 +804,7 @@ logger_loop(State) ->
 			    %% to ct_log, else write to unexpected_io
 			    %% log
 			    unexpected_io(Pid, Category, Importance, Content,
-					  CtLogFd, EscChars),
+					  CtLogFd, DoEscChars),
 			    logger_loop(State#logger_state{
 					  tc_groupleaders = TCGLs})
 		    end;
@@ -794,10 +815,11 @@ logger_loop(State) ->
 	    %% make sure no IO for this test case from the
 	    %% CT logger gets rejected
 	    test_server:permit_io(GL, self()),
-	    print_style(GL, State#logger_state.stylesheet),
+	    IoFormat = fun tc_io_format/3,
+	    print_style(GL, IoFormat, State#logger_state.stylesheet),
 	    set_evmgr_gl(GL),
 	    TCGLs = add_tc_gl(TCPid,GL,State),
-	    if not RefreshLog ->
+	    _ = if not RefreshLog ->
 		    ok;
 	       true ->
 		    make_last_run_index(State#logger_state.start_time)
@@ -824,7 +846,7 @@ logger_loop(State) ->
 	    return(From,{ok,filename:basename(State#logger_state.log_dir)}),
 	    logger_loop(State);
 	{make_last_run_index,From} ->
-	    make_last_run_index(State#logger_state.start_time),
+	    _ = make_last_run_index(State#logger_state.start_time),
 	    return(From,get(ct_log_cache)),
 	    logger_loop(State);
 	{set_stylesheet,_,SSFile} when State#logger_state.stylesheet ==
@@ -882,7 +904,7 @@ create_io_fun(FromPid, CtLogFd, EscChars) ->
 		    {_HdOrFt,S,A} -> {false,S,A};
 		    {S,A}         -> {true,S,A}
 		end,
-	    try io_lib:format(Str,Args) of
+	    try io_lib:format(Str, Args) of
 		IoStr when Escapable, EscChars, IoList == [] ->
 		    escape_chars(IoStr);
 		IoStr when Escapable, EscChars ->
@@ -925,7 +947,12 @@ print_to_log(sync, FromPid, Category, TCGL, Content, EscChars, State) ->
     if FromPid /= TCGL ->
 	    IoFun = create_io_fun(FromPid, CtLogFd, EscChars),
 	    IoList = lists:foldl(IoFun, [], Content),
-	    io:format(TCGL,["$tc_html","~ts"], [IoList]);
+	    try tc_io_format(TCGL, "~ts", [IoList]) of
+		ok -> ok
+	    catch
+		_:_ ->
+		    io:format(TCGL,"~ts", [IoList])
+	    end;
        true ->
 	    unexpected_io(FromPid, Category, ?MAX_IMPORTANCE, Content,
 			  CtLogFd, EscChars)
@@ -951,14 +978,17 @@ print_to_log(async, FromPid, Category, TCGL, Content, EscChars, State) ->
 
 			case erlang:is_process_alive(TCGL) of
 			    true ->
-				try io:format(TCGL, ["$tc_html","~ts"],
+				try tc_io_format(TCGL, "~ts",
 					      [lists:foldl(IoFun,[],Content)]) of
 				    _ -> ok
 				catch
 				    _:terminated ->
 					unexpected_io(FromPid, Category,
 						      ?MAX_IMPORTANCE,
-						      Content, CtLogFd, EscChars)
+						      Content, CtLogFd, EscChars);
+				    _:_ ->
+					io:format(TCGL, "~ts",
+						  [lists:foldl(IoFun,[],Content)])
 				end;
 			    false ->
 				unexpected_io(FromPid, Category,
@@ -1099,26 +1129,25 @@ open_ctlog(MiscIoName) ->
 	      "View I/O logged after the test run</a></li>\n</ul>\n",
 	      [MiscIoName,MiscIoName]),
 
-    print_style(Fd,undefined),
+    print_style(Fd, fun io:format/3, undefined),
     io:format(Fd, 
 	      xhtml("<br><h2>Progress Log</h2>\n<pre>\n",
 		    "<br />\n<h4>PROGRESS LOG</h4>\n<pre>\n"), []),
     Fd.
 
-print_style(Fd,undefined) ->
+print_style(Fd, IoFormat, undefined) ->
     case basic_html() of
 	true ->
-	    io:format(Fd,
-		      "<style>\n"
-		      "div.ct_internal { background:lightgrey; color:black; }\n"
-		      "div.default     { background:lightgreen; color:black; }\n"
-		      "</style>\n",
-		      []);
+	    Style = "<style>\n
+		div.ct_internal { background:lightgrey; color:black; }\n
+		div.default     { background:lightgreen; color:black; }\n
+		</style>\n",
+	    IoFormat(Fd, Style, []);
 	_ ->
 	    ok
     end;
 
-print_style(Fd,StyleSheet) ->
+print_style(Fd, IoFormat, StyleSheet) ->
     case file:read_file(StyleSheet) of
 	{ok,Bin} ->
 	    Str = b2s(Bin,encoding(StyleSheet)),
@@ -1131,28 +1160,54 @@ print_style(Fd,StyleSheet) ->
 		       N1 -> N1
 		   end,
 	    if (Pos0 == 0) and (Pos1 /= 0) ->
-		    print_style_error(Fd,StyleSheet,missing_style_start_tag);
+		    print_style_error(Fd, IoFormat,
+				      StyleSheet, missing_style_start_tag);
 	       (Pos0 /= 0) and (Pos1 == 0) ->
-		    print_style_error(Fd,StyleSheet,missing_style_end_tag);
+		    print_style_error(Fd, IoFormat,
+				      StyleSheet,missing_style_end_tag);
 	       Pos0 /= 0 ->
 		    Style = string:sub_string(Str,Pos0,Pos1+7),
-		    io:format(Fd,"~ts\n",[Style]);
+		    IoFormat(Fd,"~ts\n",[Style]);
 	       Pos0 == 0 ->
-		    io:format(Fd,"<style>~ts</style>\n",[Str])
+		    IoFormat(Fd,"<style>\n~ts</style>\n",[Str])
 	    end;
 	{error,Reason} ->
-	    print_style_error(Fd,StyleSheet,Reason)  
+	    print_style_error(Fd,IoFormat,StyleSheet,Reason)
     end.
 
-print_style_error(Fd,StyleSheet,Reason) ->
-    io:format(Fd,"\n<!-- Failed to load stylesheet ~ts: ~p -->\n",
-	      [StyleSheet,Reason]),
-    print_style(Fd,undefined).    
+print_style_error(Fd, IoFormat, StyleSheet, Reason) ->
+    IO = io_lib:format("\n<!-- Failed to load stylesheet ~ts: ~p -->\n",
+		       [StyleSheet,Reason]),
+    IoFormat(Fd, IO, []),
+    print_style(Fd, IoFormat, undefined).
 
 close_ctlog(Fd) ->
     io:format(Fd, "\n</pre>\n", []),
     io:format(Fd, [xhtml("<br><br>\n", "<br /><br />\n") | footer()], []),
-    file:close(Fd).
+    ok = file:close(Fd).
+
+%%%-----------------------------------------------------------------
+%%% tc_io_format/3
+%%% Tell common_test's IO server (group leader) not to escape
+%%% HTML characters.
+
+-spec tc_io_format(io:device(), io:format(), [term()]) -> 'ok'.
+
+tc_io_format(Fd, Format0, Args) ->
+    %% We know that the specially wrapped format string is handled
+    %% by our IO server, but Dialyzer does not and would tell us
+    %% that the call to io:format/3 would fail. Therefore, we must
+    %% fool dialyzer.
+
+    Format = case cloaked_true() of
+		 true -> ["$tc_html",Format0];
+		 false -> Format0		%Never happens.
+	     end,
+    io:format(Fd, Format, Args).
+
+%% Return 'true', but let dialyzer think that a boolean is returned.
+cloaked_true() ->
+    is_process_alive(self()).
 
 
 %%%-----------------------------------------------------------------
@@ -1733,7 +1788,7 @@ count_cases(Dir) ->
 			    %% file yet.
 			    {0,0,0,0};
 			Summary ->
-			    write_summary(SumFile, Summary),
+			    _ = write_summary(SumFile, Summary),
 			    Summary
 		    end;
 		{error, Reason} ->
@@ -1833,7 +1888,7 @@ make_all_runs_index(When) ->
     AbsName = ?abs(?all_runs_name),
     notify_and_lock_file(AbsName),
     if When == start -> ok;
-       true -> io:put_chars("Updating " ++ AbsName ++ "... ")
+       true -> io:put_chars("Updating " ++ AbsName ++ " ... ")
     end,
 
     %% check if log cache should be used, and if it exists
@@ -2048,7 +2103,7 @@ interactive_link() ->
 	 "</body>\n",
 	 "</html>\n"
 	],
-    file:write_file("last_interactive.html",unicode:characters_to_binary(Body)),
+    _ = file:write_file("last_interactive.html",unicode:characters_to_binary(Body)),
     io:format("~n~nUpdated ~ts\n"
 	      "Any CT activities will be logged here\n",
 	      [?abs("last_interactive.html")]).
@@ -2179,9 +2234,9 @@ runentry(Dir, _, _) ->
 write_totals_file(Name,Label,Logs,Totals) ->
     AbsName = ?abs(Name),
     notify_and_lock_file(AbsName),
-    force_write_file(AbsName,
-		     term_to_binary({atom_to_list(node()),
-				     Label,Logs,Totals})),
+    _ = force_write_file(AbsName,
+			 term_to_binary({atom_to_list(node()),
+					 Label,Logs,Totals})),
     notify_and_unlock_file(AbsName).
 
 %% this function needs to convert from old formats to new so that old
@@ -2226,7 +2281,7 @@ read_totals_file(Name) ->
     Result.
 
 force_write_file(Name,Contents) ->
-    force_delete(Name),
+    _ = force_delete(Name),
     file:write_file(Name,Contents).
 
 force_delete(Name) ->
@@ -2572,7 +2627,7 @@ update_tests_in_cache(TempData,LogCache=#log_cache{tests=Tests}) ->
 make_all_suites_index1(When, AbsIndexName, AllTestLogDirs) ->
     IndexName = ?index_name,
     if When == start -> ok;
-       true -> io:put_chars("Updating " ++ AbsIndexName ++ "... ")
+       true -> io:put_chars("Updating " ++ AbsIndexName ++ " ... ")
     end,
     case catch make_all_suites_index2(IndexName, AllTestLogDirs) of
 	{'EXIT', Reason} ->
@@ -2777,18 +2832,18 @@ get_cache_data({ok,CacheBin}) ->
 		true ->
 		    {ok,CacheRec};
 		false ->
-		    file:delete(?log_cache_name),
+		    _ = file:delete(?log_cache_name),
 		    {error,old_cache_file}
 	    end;				    
 	_ ->
-	    file:delete(?log_cache_name),
+	    _ = file:delete(?log_cache_name),
 	    {error,invalid_cache_file}
     end;
 get_cache_data(NoCache) ->
     NoCache.
 
 cache_vsn() ->
-    application:load(common_test),
+    _ = application:load(common_test),
     case application:get_key(common_test,vsn) of
 	{ok,VSN} ->
 	    VSN;
